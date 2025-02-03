@@ -1,0 +1,348 @@
+#!/bin/bash
+
+# Redirect stdout and stderr to archsetup.txt and still output to console
+exec > >(tee -i archsetup.txt)
+exec 2>&1
+script_dir=$( cd "$(dirname "${BASH_SOURCE[0]}")" ; pwd -P )
+
+select_option() {
+    local options=("$@")
+    local num_options=${#options[@]}
+    local selected=0
+    local last_selected=-1
+
+    while true; do
+        # Move cursor up to the start of the menu
+        if [ $last_selected -ne -1 ]; then
+            echo -ne "\033[${num_options}A"
+        fi
+
+        if [ $last_selected -eq -1 ]; then
+            echo "Please select an option using the arrow keys and Enter:"
+        fi
+        for i in "${!options[@]}"; do
+            if [ "$i" -eq $selected ]; then
+                echo "> ${options[$i]}"
+            else
+                echo "  ${options[$i]}"
+            fi
+        done
+
+        last_selected=$selected
+
+        # Read user input
+        read -rsn1 key
+        case $key in
+            $'\x1b') # ESC sequence
+                read -rsn2 -t 0.1 key
+                case $key in
+                    '[A') # Up arrow
+                        ((selected--))
+                        if [ $selected -lt 0 ]; then
+                            selected=$((num_options - 1))
+                        fi
+                        ;;
+                    '[B') # Down arrow
+                        ((selected++))
+                        if [ $selected -ge $num_options ]; then
+                            selected=0
+                        fi
+                        ;;
+                esac
+                ;;
+            '') # Enter key
+                break
+                ;;
+        esac
+    done
+
+    return $selected
+}
+
+# @description This function will handle file systems. At this movement we are handling only
+# btrfs and ext4. Others will be added in future.
+filesystem () {
+    echo -ne "
+    Please Select your file system for both boot and root
+    "
+    options=("btrfs" "ext4" "luks" "exit")
+    select_option "${options[@]}"
+
+    case $? in
+    0) export FS=btrfs;;
+    1) export FS=ext4;;
+    2)
+        set_password "LUKS_PASSWORD"
+        export FS=luks
+        ;;
+    3) exit ;;
+    *) echo "Wrong option please select again"; filesystem;;
+    esac
+}
+
+# @description Detects and sets timezone.
+timezone () {
+    # Added this from arch wiki https://wiki.archlinux.org/title/System_time
+    time_zone="$(curl --fail https://ipapi.co/timezone)"
+    echo -ne "
+    System detected your timezone to be '$time_zone' \n"
+    echo -ne "Is this correct?
+    "
+    options=("Yes" "No")
+    select_option "${options[@]}"
+
+    case ${options[$?]} in
+        y|Y|yes|Yes|YES)
+        echo "${time_zone} set as timezone"
+        export TIMEZONE=$time_zone;;
+        n|N|no|NO|No)
+        echo "Please enter your desired timezone e.g. Europe/London :"
+        read -r new_timezone
+        echo "${new_timezone} set as timezone"
+        export TIMEZONE=$new_timezone;;
+        *) echo "Wrong option. Try again";timezone;;
+    esac
+}
+# @description Set user's keyboard mapping.
+keymap () {
+    echo -ne "
+    Please select key board layout from this list"
+    # These are default key maps as presented in official arch repo archinstall
+    options=(us by ca cf cz de dk es et fa fi fr gr hu il it lt lv mk nl no pl ro ru se sg ua uk)
+
+    select_option "${options[@]}"
+    keymap=${options[$?]}
+
+    echo -ne "Your key boards layout: ${keymap} \n"
+    export KEYMAP=$keymap
+}
+
+# @description Disk selection for drive to be used with installation.
+diskpart () {
+echo -ne "
+------------------------------------------------------------------------
+    THIS WILL FORMAT AND DELETE ALL DATA ON THE DISK
+    Please make sure you know what you are doing because
+    after formatting your disk there is no way to get data back
+    *****BACKUP YOUR DATA BEFORE CONTINUING*****
+    ***I AM NOT RESPONSIBLE FOR ANY DATA LOSS***
+------------------------------------------------------------------------
+
+"
+
+    PS3='
+    Select the disk to install on: '
+    options=($(lsblk -n --output TYPE,KNAME,SIZE | awk '$1=="disk"{print "/dev/"$2"|"$3}'))
+
+    select_option "${options[@]}"
+    disk=${options[$?]%|*}
+
+    echo -e "\n${disk%|*} selected \n"
+        export DISK=${disk%|*}
+
+}
+
+# @description Gather username and password to be used for installation.
+userinfo () {
+    # Loop through user input until the user gives a valid username
+    while true
+    do
+            read -r -p "Please enter username: " username
+            if [[ "${username,,}" =~ ^[a-z_]([a-z0-9_-]{0,31}|[a-z0-9_-]{0,30}\$)$ ]]
+            then
+                    break
+            fi
+            echo "Incorrect username."
+    done
+    export USERNAME=$username
+
+    while true
+    do
+        read -rs -p "Please enter password: " PASSWORD1
+        echo -ne "\n"
+        read -rs -p "Please re-enter password: " PASSWORD2
+        echo -ne "\n"
+        if [[ "$PASSWORD1" == "$PASSWORD2" ]]; then
+            break
+        else
+            echo -ne "ERROR! Passwords do not match. \n"
+        fi
+    done
+    export PASSWORD=$PASSWORD1
+
+     # Loop through user input until the user gives a valid hostname, but allow the user to force save
+    while true
+    do
+            read -r -p "Please name your machine: " name_of_machine
+            # hostname regex (!!couldn't find spec for computer name!!)
+            if [[ "${name_of_machine,,}" =~ ^[a-z][a-z0-9_.-]{0,62}[a-z0-9]$ ]]
+            then
+                    break
+            fi
+            # if validation fails allow the user to force saving of the hostname
+            read -r -p "Hostname doesn't seem correct. Do you still want to save it? (y/n)" force
+            if [[ "${force,,}" = "y" ]]
+            then
+                    break
+            fi
+    done
+    export NAME_OF_MACHINE=$name_of_machine
+}
+
+# Starting functions
+clear
+userinfo
+clear
+diskpart
+clear
+filesystem
+clear
+timezone
+clear
+keymap
+
+timedatectl set-ntp true
+pacman -Sy
+pacman -S --noconfirm archlinux-keyring #update keyrings to latest to prevent packages failing to install
+sed -i 's/^#ParallelDownloads/ParallelDownloads/' /etc/pacman.conf
+pacman -S --noconfirm --needed rsync
+if [ ! -d "/mnt" ]; then
+    mkdir /mnt
+fi
+echo -ne "
+-------------------------------------------------------------------------
+                    Installing Prerequisites
+-------------------------------------------------------------------------
+"
+pacman -S --noconfirm --needed gptfdisk btrfs-progs glibc
+echo -ne "
+-------------------------------------------------------------------------
+                    Formatting Disk
+-------------------------------------------------------------------------
+"
+umount -A --recursive /mnt # make sure everything is unmounted before we start
+# disk prep
+sgdisk -Z "${DISK}" # zap all on disk
+sgdisk -a 2048 -o "${DISK}" # new gpt disk 2048 alignment
+
+# create partitions
+sgdisk -n 1::+1GiB --typecode=1:ef00 --change-name=2:'EFIBOOT' "${DISK}" # partition 2 (UEFI Boot Partition)
+sgdisk -n 2::-0 --typecode=2:8300 --change-name=3:'ROOT' "${DISK}" # partition 3 (Root), default start, remaining
+partprobe "${DISK}" # reread partition table to ensure it is correct
+
+if [[ "${DISK}" =~ "nvme" ]]; then
+    partition1=${DISK}p1
+    partition2=${DISK}p2
+else
+    partition1=${DISK}1
+    partition2=${DISK}2
+fi
+
+mkfs.vfat -F32 -n "EFIBOOT" "${partition1}"
+mkfs.btrfs -f "${partition2}"
+mount -t btrfs "${partition2}" /mnt
+
+BOOT_UUID=$(blkid -s UUID -o value "${partition1}")
+ROOT_UUID=$(blkid -s UUID -o value "${partition2}")
+
+sync
+if ! mountpoint -q /mnt; then
+    echo "ERROR! Failed to mount ${partition2} to /mnt after multiple attempts."
+    exit 1
+fi
+mount -t vfat -U "${BOOT_UUID}" /mnt/boot/
+
+if ! grep -qs '/mnt' /proc/mounts; then
+    echo "Drive is not mounted can not continue"
+    echo "Rebooting in 3 Seconds ..." && sleep 1
+    echo "Rebooting in 2 Seconds ..." && sleep 1
+    echo "Rebooting in 1 Second ..." && sleep 1
+    reboot now
+fi
+
+pacstrap -K /mnt base base-devel linux-lts linux-firmware stow --noconfirm --needed
+
+genfstab -U /mnt >> /mnt/etc/fstab
+echo "
+  Generated /etc/fstab:
+"
+cat /mnt/etc/fstab
+
+arch-chroot /mnt /bin/bash -c "KEYMAP='${KEYMAP}' /bin/bash" <<EOF
+
+pacman -S --noconfirm --needed networkmanager dhclient
+systemctl enable --now NetworkManager
+pacman -S --noconfirm --needed stow arch-install-scripts git ntp
+
+sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+timedatectl --no-ask-password set-timezone ${TIMEZONE}
+timedatectl --no-ask-password set-ntp 1
+localectl --no-ask-password set-locale LANG="en_US.UTF-8" LC_TIME="en_US.UTF-8"
+ln -s /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
+
+# Set keymaps
+echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
+echo "XKBLAYOUT=${KEYMAP}" >> /etc/vconsole.conf
+echo "Keymap set to: ${KEYMAP}"
+
+# Add sudo no password rights
+sed -i 's/^# %wheel ALL=(ALL) NOPASSWD: ALL/%wheel ALL=(ALL) NOPASSWD: ALL/' /etc/sudoers
+sed -i 's/^# %wheel ALL=(ALL:ALL) NOPASSWD: ALL/%wheel ALL=(ALL:ALL) NOPASSWD: ALL/' /etc/sudoers
+
+#Add parallel downloading
+sed -i 's/^#ParallelDownloads/ParallelDownloads/' /etc/pacman.conf
+
+#Enable multilib
+sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
+pacman -Sy --noconfirm --needed
+
+echo -ne "
+-------------------------------------------------------------------------
+                    Adding User
+-------------------------------------------------------------------------
+"
+groupadd libvirt
+useradd -m -G wheel,libvirt,audio,video,input,uucp -s /bin/bash $USERNAME
+echo "$USERNAME created, home directory created, added to wheel and libvirt group, default shell set to /bin/bash"
+echo "$USERNAME:$PASSWORD" | chpasswd
+echo "$USERNAME password set"
+echo $NAME_OF_MACHINE > /etc/hostname
+
+
+echo -ne "
+Final Setup and Configurations
+EFI Stub Install
+"
+echo "root=UUID=$ROOT_UUID rw quiet splash vt.global_cursor_default=0" >> /etc/cmdline.d/root.conf
+cp $script_dir/linux.preset /etc/mkinitcpio.d/linux.preset
+mkdir -p /boot/EFI/Linux
+bootctl install
+mkinitcpio -p Linux
+echo -ne "
+-------------------------------------------------------------------------
+                    Enabling Essential Services
+-------------------------------------------------------------------------
+"
+ntpd -qg
+systemctl enable ntpd.service
+echo "  NTP enabled"
+systemctl disable dhcpcd.service
+echo "  DHCP disabled"
+systemctl stop dhcpcd.service
+echo "  DHCP stopped"
+systemctl enable NetworkManager.service
+echo "  NetworkManager enabled"
+
+echo -ne "
+-------------------------------------------------------------------------
+                    Cleaning
+-------------------------------------------------------------------------
+"
+# Remove no password sudo rights
+sed -i 's/^%wheel ALL=(ALL) NOPASSWD: ALL/# %wheel ALL=(ALL) NOPASSWD: ALL/' /etc/sudoers
+sed -i 's/^%wheel ALL=(ALL:ALL) NOPASSWD: ALL/# %wheel ALL=(ALL:ALL) NOPASSWD: ALL/' /etc/sudoers
+# Add sudo rights
+sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+EOF
